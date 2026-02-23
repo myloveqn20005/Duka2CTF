@@ -1,12 +1,44 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows7.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImplicitUsings>enable</ImplicitUsings>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="SharpCompress" Version="0.46.2" />
-  </ItemGroup>
+
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<TargetFramework>net8.0-windows7.0</TargetFramework>
+		<Nullable>enable</Nullable>
+		<UseWindowsForms>true</UseWindowsForms>
+		<ImplicitUsings>enable</ImplicitUsings>
+
+		<!-- Fix lỗi duplicate Assembly attributes (CS0579) -->
+		<!-- Tắt generate tự động các attribute để tránh conflict với thư viện hoặc file thủ công -->
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+		<GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+		<GenerateAssemblyTitleAttribute>false</GenerateAssemblyTitleAttribute>
+		<GenerateAssemblyVersionAttribute>false</GenerateAssemblyVersionAttribute>
+		<GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+
+		<!-- Fix lỗi CS8357 (wildcard * trong AssemblyVersion của LZMA/SevenZip) -->
+		<!-- Tắt deterministic build để cho phép version string có wildcard -->
+		<Deterministic>false</Deterministic>
+
+		<!-- Các tùy chọn bổ sung tốt cho Windows Forms .NET 8 -->
+		<ApplicationIcon />
+		<!-- Nếu có icon, thêm đường dẫn ở đây -->
+		<!-- Nếu dùng manifest -->
+		<Platforms>AnyCPU;x64</Platforms>
+		<!-- Hỗ trợ x64 tốt hơn -->
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="SharpCompress" Version="0.46.2" />
+		<!-- Nếu bạn dùng SevenZip.Compression.LZMA thủ công (không qua NuGet), không cần thêm package -->
+		<!-- Nếu sau này muốn dùng NuGet chính thức cho LZMA, có thể thêm: -->
+		<!-- <PackageReference Include="LZMA-SDK" Version="..." /> -->
+	</ItemGroup>
+
+	<!-- Nếu bạn có file AssemblyInfo thủ công (Properties/AssemblyInfo.cs), có thể exclude nó -->
+	<ItemGroup>
+		<!-- <Compile Remove="Properties\AssemblyInfo.cs" /> -->
+		<!-- Uncomment nếu cần -->
+	</ItemGroup>
+
 </Project>

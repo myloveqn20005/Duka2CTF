@@ -3,7 +3,7 @@ using System.IO;
 
 namespace Duka2CTF.io;
 
-public class TickFileBuilder
+public class TickFileBuilder : IDisposable
 {
 	private string fileName;
 
@@ -85,4 +85,9 @@ public class TickFileBuilder
 			writer.Write(data);
 		}
 	}
+
+    public void Dispose()
+    {
+        Close();
+    }
 }

@@ -9,6 +9,22 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
+// Extension static class để Invoke an toàn từ thread khác (sửa CS1593 & CS1106)
+public static class InvokeExtensions
+{
+    public static void InvokeIfRequired(this Control control, Action action)
+    {
+        if (control.InvokeRequired)
+        {
+            control.Invoke(action);
+        }
+        else
+        {
+            action();
+        }
+    }
+}
+
 namespace Duka2CTF
 {
     public partial class MainForm : Form
@@ -142,7 +158,6 @@ namespace Duka2CTF
                 MessageBox.Show("Vui lòng chọn symbol.", "Thông báo", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-
             if (!IsValidSymbol(symbol))
             {
                 MessageBox.Show($"Symbol '{symbol}' không được hỗ trợ.", "Lỗi", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -228,30 +243,37 @@ namespace Duka2CTF
                     int lastAsk = 0;
                     bool hasData = false;
 
-                    for (int h = 0; h < 24; h++)
-                    {
-                        if (ct.IsCancellationRequested) break;
+                    // Học dukascopy-node: tải song song các giờ trong ngày
+                    var hours = Enumerable.Range(0, 24).ToList();
 
+                    await Parallel.ForEachAsync(hours, new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = 4,
+                        CancellationToken = ct
+                    }, async (h, token) =>
+                    {
                         var hourTicks = await DukascopyDownloader.DownloadHourTicksAsync(
-                            symbol, current, h, digits, ct);
+                            symbol, current, h, digits, token);
 
                         if (hourTicks.Count > 0)
                         {
-                            hasData = true;
-                            hourTicks = hourTicks.OrderBy(t => t.Utc).ToList();
+                            lock (builder) // Lock để add day an toàn từ nhiều thread
+                            {
+                                hourTicks = hourTicks.OrderBy(t => t.Utc).ToList();
+                                byte[] encoded = CtfProcessor.EncodeDay(
+                                    hourTicks,
+                                    ref lastTime,
+                                    ref lastBid,
+                                    ref lastAsk);
 
-                            byte[] encoded = CtfProcessor.EncodeDay(
-                                hourTicks,
-                                ref lastTime,
-                                ref lastBid,
-                                ref lastAsk);
-
-                            int dayNum = Utils.TimeToDayNumber(hourTicks[0].Utc);
-                            builder.AddDay(encoded, dayNum);
+                                int dayNum = Utils.TimeToDayNumber(hourTicks[0].Utc);
+                                builder.AddDay(encoded, dayNum);
+                                hasData = true;
+                            }
 
                             hourTicks.Clear();
                         }
-                    }
+                    });
 
                     if (hasData)
                         txtLogs.AppendText($"Xong ngày {current:dd/MM/yyyy}\r\n");
@@ -277,7 +299,7 @@ namespace Duka2CTF
         }
 
         // =========================================================
-        // CSV EXPORT (streaming – tương tự CTF)
+        // CSV EXPORT (streaming – tối ưu song song, fix lỗi await/lock/Invoke)
         // =========================================================
         private async void btnTestToCSV_Click(object sender, EventArgs e)
         {
@@ -325,8 +347,7 @@ namespace Duka2CTF
                 DateTime epoch = DateTime.UnixEpoch;
                 int totalDays = (int)(endDate - current).TotalDays + 1;
                 int processed = 0;
-
-                const int FLUSH_EVERY = 10000; // tăng lên để giảm I/O overhead
+                const int FLUSH_EVERY = 10000;
 
                 while (current <= endDate && !_cts.Token.IsCancellationRequested)
                 {
@@ -349,57 +370,67 @@ namespace Duka2CTF
                     {
                         await writer.WriteLineAsync("timestamp,askPrice,bidPrice");
 
-                        for (int h = 0; h < 24; h++)
-                        {
-                            _cts.Token.ThrowIfCancellationRequested();
+                        var hours = Enumerable.Range(0, 24).ToList();
 
+                        await Parallel.ForEachAsync(hours, new ParallelOptions
+                        {
+                            MaxDegreeOfParallelism = 4,
+                            CancellationToken = _cts.Token
+                        }, async (h, token) =>
+                        {
                             int hourTickCount = 0;
 
                             try
                             {
                                 await foreach (var t in DukascopyDownloader.DownloadHourTicksStreamingAsync(
-                                    symbol, current, h, digits, _cts.Token))
+                                    symbol, current, h, digits, token))
                                 {
                                     DateTime dt = epoch.AddMilliseconds(t.Utc);
                                     string askStr = (t.Ask / factor).ToString(formatStr, CultureInfo.InvariantCulture);
                                     string bidStr = (t.Bid / factor).ToString(formatStr, CultureInfo.InvariantCulture);
                                     string line = $"{dt:yyyy.MM.dd HH:mm:ss.fff},{askStr},{bidStr}";
 
-                                    await writer.WriteLineAsync(line);
-                                    dailyTickCount++;
-                                    hourTickCount++;
-
-                                    if (!hasSampleLogged && hourTickCount == 1)
+                                    lock (writer)
                                     {
-                                        txtLogs.AppendText(
-                                            $" → Giờ {h:00}h: ... ticks | mẫu: Ask={askStr}, Bid={bidStr}\r\n");
-                                        hasSampleLogged = true;
-                                    }
+                                        writer.WriteLine(line); // synchronous WriteLine
+                                        dailyTickCount++;
+                                        hourTickCount++;
 
-                                    if (hourTickCount % FLUSH_EVERY == 0)
-                                    {
-                                        await writer.FlushAsync();
+                                        if (!hasSampleLogged && hourTickCount == 1)
+                                        {
+                                            txtLogs.InvokeIfRequired(() =>
+                                                txtLogs.AppendText(
+                                                    $" → Giờ {h:00}h: ... ticks | mẫu: Ask={askStr}, Bid={bidStr}\r\n"));
+                                            hasSampleLogged = true;
+                                        }
+
+                                        if (hourTickCount % FLUSH_EVERY == 0)
+                                        {
+                                            writer.Flush(); // synchronous Flush
+                                        }
                                     }
                                 }
                             }
                             catch (Exception exHour)
                             {
-                                txtLogs.AppendText($" ! Lỗi tải giờ {h:00}h: {exHour.Message}\r\n");
-                                continue;
+                                txtLogs.InvokeIfRequired(() =>
+                                    txtLogs.AppendText($" ! Lỗi tải giờ {h:00}h: {exHour.Message}\r\n"));
                             }
 
-                            if (hourTickCount > 0)
+                            lock (writer)
                             {
-                                validHourCount++;
-                                await writer.FlushAsync();
+                                if (hourTickCount > 0)
+                                {
+                                    validHourCount++;
+                                    writer.Flush();
+                                }
                             }
 
-                            // Chỉ gọi GC khi số tick lớn (giảm overhead)
                             if (hourTickCount > 50000)
                             {
                                 GC.Collect(GC.MaxGeneration, GCCollectionMode.Optimized, false);
                             }
-                        }
+                        });
 
                         await writer.FlushAsync();
                     }

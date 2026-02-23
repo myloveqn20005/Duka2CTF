@@ -12,7 +12,7 @@ namespace Duka2CTF.io
 {
     public static class DukascopyDownloader
     {
-        private static readonly HashSet<string> ValidSymbols = new(StringComparer.OrdinalIgnoreCase)
+        public static readonly HashSet<string> ValidSymbols = new(StringComparer.OrdinalIgnoreCase)
         {
             "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
             "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "US30", "DE40", "SPX500", "NAS100"
@@ -24,7 +24,6 @@ namespace Duka2CTF.io
             ["XAGUSD"] = (5, 100),
             ["BTCUSD"] = (1000, 200000),
             ["ETHUSD"] = (50, 20000),
-            // có thể mở rộng thêm nếu cần
         };
 
         private static readonly Dictionary<string, double> SymbolPointDividers = new()
@@ -35,11 +34,14 @@ namespace Duka2CTF.io
             ["ETHUSD"] = 1.0
         };
 
+        // Học từ dukascopy-node: retry nhiều hơn, backoff exponential + jitter mạnh
         private static readonly TimeSpan[] BackoffDelays =
         {
             TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(2),
             TimeSpan.FromSeconds(4),
-            TimeSpan.FromSeconds(10)
+            TimeSpan.FromSeconds(8),
+            TimeSpan.FromSeconds(16)
         };
 
         private static int ReadInt32BE(Span<byte> data, int pos)
@@ -62,23 +64,24 @@ namespace Duka2CTF.io
                 yield break;
             }
 
-            if (!SymbolPointDividers.TryGetValue(symbol, out double divider))
-                divider = 100000.0;
+            double divider = SymbolPointDividers.TryGetValue(symbol, out var d) ? d : 100000.0;
 
             string url = $"https://datafeed.dukascopy.com/datafeed/{symbol}/{day.Year}/{(day.Month - 1):D2}/{day.Day:D2}/{hour:D2}h_ticks.bi5";
 
-            const int MAX_RETRIES = 3;
+            const int MAX_RETRIES = 5; // học dukascopy-node: 5 lần retry
+
             int retry = 0;
 
             while (retry <= MAX_RETRIES)
             {
-                HttpClient? client = null;
+                using var client = CreateHttpClient(); // Tạo mới mỗi retry → tránh pending read
+                Stream? rawStream = null;
+                bool setupSuccess = false;
+
                 try
                 {
-                    client = CreateHttpClient();
-
                     using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    cts.CancelAfter(TimeSpan.FromSeconds(45)); // timeout mỗi request
+                    cts.CancelAfter(TimeSpan.FromSeconds(60)); // tăng timeout lên 60s
 
                     using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token);
 
@@ -91,89 +94,22 @@ namespace Duka2CTF.io
                         if (retry <= MAX_RETRIES)
                         {
                             var delay = BackoffDelays[Math.Min(retry - 1, BackoffDelays.Length - 1)];
-                            // Thêm jitter nhỏ
-                            delay += TimeSpan.FromMilliseconds(Random.Shared.Next(0, 500));
+                            delay += TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1500)); // jitter lớn hơn
                             await Task.Delay(delay, ct);
                         }
                         continue;
                     }
 
-                    await using var rawStream = await response.Content.ReadAsStreamAsync(ct);
+                    rawStream = await response.Content.ReadAsStreamAsync(ct);
 
                     byte[] props = new byte[5];
                     int read = await rawStream.ReadAsync(props, 0, 5, ct);
                     if (read < 5) yield break;
 
                     var decoder = new Decoder();
-                    try
-                    {
-                        decoder.SetDecoderProperties(props);
-                    }
-                    catch
-                    {
-                        // header LZMA corrupt → retry
-                        retry++;
-                        if (retry <= MAX_RETRIES)
-                        {
-                            await Task.Delay(BackoffDelays[Math.Min(retry - 1, BackoffDelays.Length - 1)], ct);
-                        }
-                        continue;
-                    }
+                    decoder.SetDecoderProperties(props);
 
-                    const int BUFFER_SIZE = 16384;
-                    byte[] buffer = new byte[BUFFER_SIZE];
-                    byte[] tickBuffer = new byte[20];
-                    int tickPos = 0;
-
-                    while (!ct.IsCancellationRequested)
-                    {
-                        int bytesRead = await rawStream.ReadAsync(buffer, 0, BUFFER_SIZE, ct);
-                        if (bytesRead == 0) break;
-
-                        for (int j = 0; j < bytesRead; j++)
-                        {
-                            tickBuffer[tickPos++] = buffer[j];
-
-                            if (tickPos == 20)
-                            {
-                                int ms = ReadInt32BE(tickBuffer, 0);
-                                int askPoints = ReadInt32BE(tickBuffer, 4);
-                                int bidPoints = ReadInt32BE(tickBuffer, 8);
-
-                                if (ms < 0 || ms >= 3600000 || askPoints <= 0 || bidPoints <= 0)
-                                {
-                                    tickPos = 0;
-                                    continue;
-                                }
-
-                                double askPrice = askPoints / divider;
-                                double bidPrice = bidPoints / divider;
-
-                                // Validation giá theo symbol
-                                if (PriceRanges.TryGetValue(symbol, out var range))
-                                {
-                                    if (askPrice < range.MinPrice || askPrice > range.MaxPrice ||
-                                        bidPrice < range.MinPrice || bidPrice > range.MaxPrice)
-                                    {
-                                        tickPos = 0;
-                                        continue;
-                                    }
-                                }
-
-                                DateTime dt = day.Date.AddHours(hour).AddMilliseconds(ms);
-                                long utcMs = (long)(dt - DateTime.UnixEpoch).TotalMilliseconds;
-
-                                int askScaled = (int)Math.Round(askPrice * Math.Pow(10, digits));
-                                int bidScaled = (int)Math.Round(bidPrice * Math.Pow(10, digits));
-
-                                yield return new Tick(bidScaled, askScaled, utcMs);
-
-                                tickPos = 0;
-                            }
-                        }
-                    }
-
-                    yield break;
+                    setupSuccess = true;
                 }
                 catch (OperationCanceledException)
                 {
@@ -181,17 +117,86 @@ namespace Duka2CTF.io
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"Hour {hour} error (retry {retry}/{MAX_RETRIES}): {ex.Message}");
+                    System.Diagnostics.Debug.WriteLine($"Hour {hour} setup error (retry {retry}/{MAX_RETRIES}): {ex.Message}");
                     retry++;
                     if (retry <= MAX_RETRIES)
                     {
                         var delay = BackoffDelays[Math.Min(retry - 1, BackoffDelays.Length - 1)];
+                        delay += TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1500));
                         await Task.Delay(delay, ct);
                     }
                 }
                 finally
                 {
-                    client?.Dispose();
+                    if (!setupSuccess)
+                    {
+                        rawStream?.Dispose();
+                    }
+                }
+
+                if (setupSuccess && rawStream != null)
+                {
+                    try
+                    {
+                        const int BUFFER_SIZE = 16384;
+                        byte[] buffer = new byte[BUFFER_SIZE];
+                        byte[] tickBuffer = new byte[20];
+                        int tickPos = 0;
+
+                        while (!ct.IsCancellationRequested)
+                        {
+                            int bytesRead = await rawStream.ReadAsync(buffer, 0, BUFFER_SIZE, ct);
+                            if (bytesRead == 0) break;
+
+                            for (int j = 0; j < bytesRead; j++)
+                            {
+                                tickBuffer[tickPos++] = buffer[j];
+
+                                if (tickPos == 20)
+                                {
+                                    int ms = ReadInt32BE(tickBuffer, 0);
+                                    int askPoints = ReadInt32BE(tickBuffer, 4);
+                                    int bidPoints = ReadInt32BE(tickBuffer, 8);
+
+                                    if (ms < 0 || ms >= 3600000 || askPoints <= 0 || bidPoints <= 0)
+                                    {
+                                        tickPos = 0;
+                                        continue;
+                                    }
+
+                                    double askPrice = askPoints / divider;
+                                    double bidPrice = bidPoints / divider;
+
+                                    if (PriceRanges.TryGetValue(symbol, out var range))
+                                    {
+                                        if (askPrice < range.MinPrice || askPrice > range.MaxPrice ||
+                                            bidPrice < range.MinPrice || bidPrice > range.MaxPrice)
+                                        {
+                                            tickPos = 0;
+                                            continue;
+                                        }
+                                    }
+
+                                    DateTime dt = day.Date.AddHours(hour).AddMilliseconds(ms);
+                                    long utcMs = (long)(dt - DateTime.UnixEpoch).TotalMilliseconds;
+
+                                    int askScaled = (int)Math.Round(askPrice * Math.Pow(10, digits));
+                                    int bidScaled = (int)Math.Round(bidPrice * Math.Pow(10, digits));
+
+                                    yield return new Tick(bidScaled, askScaled, utcMs);
+
+                                    tickPos = 0;
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        rawStream.Dispose();
+                        client?.Dispose(); //
+                    }
+
+                    yield break; // Thành công
                 }
             }
         }
@@ -200,21 +205,21 @@ namespace Duka2CTF.io
         {
             var handler = new SocketsHttpHandler
             {
-                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                PooledConnectionLifetime = TimeSpan.Zero, // Tắt pool lifetime → mỗi client độc lập
                 MaxConnectionsPerServer = 6,
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5)
+                PooledConnectionIdleTimeout = TimeSpan.Zero // Tắt idle timeout
             };
 
             return new HttpClient(handler)
             {
-                Timeout = Timeout.InfiniteTimeSpan // dùng CancellationToken thay vì global timeout
+                Timeout = Timeout.InfiniteTimeSpan
             };
         }
 
         public static async Task<List<Tick>> DownloadHourTicksAsync(
             string symbol, DateTime day, int hour, int digits, CancellationToken ct = default)
         {
-            var list = new List<Tick>(capacity: 50000);
+            var list = new List<Tick>(50000);
             await foreach (var tick in DownloadHourTicksStreamingAsync(symbol, day, hour, digits, ct))
             {
                 list.Add(tick);
